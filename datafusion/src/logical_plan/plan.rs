@@ -17,11 +17,7 @@
 //! This module contains the  `LogicalPlan` enum that describes queries
 //! via a logical query plan.
 
-use std::{
-    cmp::min,
-    fmt::{self, Display},
-    sync::Arc,
-};
+use std::{cmp::min, fmt::{self, Debug, Display}, sync::Arc};
 
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 
@@ -308,8 +304,8 @@ impl LogicalPlan {
             | LogicalPlan::Limit { .. }
             | LogicalPlan::CreateExternalTable { .. }
             | LogicalPlan::CrossJoin { .. }
-            | LogicalPlan::Explain { .. }
-            | LogicalPlan::Union { .. } => {
+            | LogicalPlan::Union { .. }
+            | LogicalPlan::Explain { .. } => {
                 vec![]
             }
         }
@@ -329,11 +325,11 @@ impl LogicalPlan {
             LogicalPlan::Limit { input, .. } => vec![input],
             LogicalPlan::Extension { node } => node.inputs(),
             LogicalPlan::Union { inputs, .. } => inputs.iter().collect(),
+            LogicalPlan::Explain { plan, .. } => vec![plan],
             // plans without inputs
             LogicalPlan::TableScan { .. }
             | LogicalPlan::EmptyRelation { .. }
-            | LogicalPlan::CreateExternalTable { .. }
-            | LogicalPlan::Explain { .. } => vec![],
+            | LogicalPlan::CreateExternalTable { .. } => vec![],
         }
     }
 }
@@ -438,11 +434,11 @@ impl LogicalPlan {
                 }
                 true
             }
+            LogicalPlan::Explain { plan, .. } => plan.accept(visitor)?,
             // plans without inputs
             LogicalPlan::TableScan { .. }
             | LogicalPlan::EmptyRelation { .. }
-            | LogicalPlan::CreateExternalTable { .. }
-            | LogicalPlan::Explain { .. } => true,
+            | LogicalPlan::CreateExternalTable { .. } => true,
         };
         if !recurse {
             return Ok(false);

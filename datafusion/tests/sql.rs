@@ -42,6 +42,7 @@ use datafusion::{
     physical_plan::ColumnarValue,
 };
 use datafusion::{execution::context::ExecutionContext, physical_plan::displayable};
+use log::debug;
 
 #[tokio::test]
 async fn nyc() -> Result<()> {
@@ -1559,6 +1560,8 @@ async fn csv_explain() {
     register_aggregate_csv_by_sql(&mut ctx).await;
     let sql = "EXPLAIN SELECT c1 FROM aggregate_test_100 where c2 > 10";
     let actual = execute(&mut ctx, sql).await;
+    debug!("Logical plan: {:#?}", actual);
+    println!("Logical plan: {:#?}", actual);
     let expected = vec![
         vec![
             "logical_plan",
@@ -1571,6 +1574,30 @@ async fn csv_explain() {
     let sql = "explain SELECT c1 FROM aggregate_test_100 where c2 > 10";
     let actual = execute(&mut ctx, sql).await;
     assert_eq!(expected, actual);
+
+    // Explain
+    println!("EXPLAIN -------------------------");
+    let logical_plan = ctx.sql("explain SELECT c1 FROM aggregate_test_100 where c2 > 10").unwrap().to_logical_plan();
+    println!("Logical Plan of 'explain SELECT c1 FROM aggregate_test_100 where c2 > 10': {}", logical_plan.display_indent_schema());
+
+    let optimized_logical_plan = ctx.optimize(&logical_plan).unwrap();
+    println!("Optimized Logical plan: {}", optimized_logical_plan.display_indent_schema());
+    println!("Graphviz optimized Logical plan {}", optimized_logical_plan.display_graphviz());
+
+    let physical_plan = ctx.create_physical_plan(&optimized_logical_plan).unwrap();
+    println!("Physical plan: {}", displayable(physical_plan.as_ref()).indent());
+
+    // Explain verbose
+    println!("EXPLAIN VERBOSE-------------------------");
+    let logical_plan = ctx.sql("explain verbose SELECT c1 FROM aggregate_test_100 where c2 > 10").unwrap().to_logical_plan();
+    println!("Logical Plan of 'explain verbose SELECT c1 FROM aggregate_test_100 where c2 > 10': {}", logical_plan.display_indent_schema());
+
+    let optimized_logical_plan = ctx.optimize(&logical_plan).unwrap();
+    println!("Optimized Logical plan: {}", optimized_logical_plan.display_indent_schema());
+    println!("Graphviz optimized Logical plan {}", optimized_logical_plan.display_graphviz());
+
+    let physical_plan = ctx.create_physical_plan(&optimized_logical_plan).unwrap();
+    println!("Physical plan: {}", displayable(physical_plan.as_ref()).indent());
 }
 
 #[tokio::test]
@@ -1579,6 +1606,7 @@ async fn csv_explain_verbose() {
     register_aggregate_csv_by_sql(&mut ctx).await;
     let sql = "EXPLAIN VERBOSE SELECT c1 FROM aggregate_test_100 where c2 > 10";
     let actual = execute(&mut ctx, sql).await;
+    println!("Logical plan: {:#?}", actual);
 
     // flatten to a single string
     let actual = actual.into_iter().map(|r| r.join("\t")).collect::<String>();

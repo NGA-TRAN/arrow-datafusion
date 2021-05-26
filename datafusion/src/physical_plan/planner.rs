@@ -409,7 +409,11 @@ impl DefaultPhysicalPlanner {
                 stringified_plans,
                 schema,
             } => {
+                println!("INSIDE  create_physical_plan of EXPLAIN --------------------------");
+                println!("INSIDE  create_physical_plan of EXPLAIN - initial stringified_plans: {:?}", stringified_plans);
+
                 let input = self.create_initial_plan(plan, ctx_state)?;
+                println!("INSIDE create_physical_plan of EXPLAIN  - Physical plan: {}", displayable(input.as_ref()).indent());
 
                 let mut stringified_plans = stringified_plans
                     .iter()
@@ -417,12 +421,18 @@ impl DefaultPhysicalPlanner {
                     .cloned()
                     .collect::<Vec<_>>();
 
+                println!("INSIDE  create_physical_plan of EXPLAIN -  stringified_plans 2: {:?}", stringified_plans);
+                                
                 // add in the physical plan if requested
                 if *verbose {
+
+                    println!("INSIDE VERBOSE ---------");
                     stringified_plans.push(StringifiedPlan::new(
                         PlanType::PhysicalPlan,
                         displayable(input.as_ref()).indent().to_string(),
                     ));
+
+                    println!("INSIDE  create_physical_plan of EXPLAIN -  stringified_plans 3: {:?}", stringified_plans);
                 }
                 Ok(Arc::new(ExplainExec::new(
                     SchemaRef::new(schema.as_ref().to_owned().into()),
