@@ -1476,6 +1476,27 @@ mod tests {
             PartitioningSatisfaction::NotSatisfied,
         );
 
+        let fixture_with_col1 = PartitioningTestFixture::new(vec![
+            ("key", DataType::Utf8),
+            ("timestamp", DataType::Timestamp(TimeUnit::Nanosecond, None)),
+            ("col1", DataType::Utf8),
+        ])?;
+        let aligned_with_col1 =
+            fixture_with_col1.range_partitioning([1], vec![ts_ns_split(hour_ns)]);
+        let trunc_hour_superset = Distribution::KeyPartitioned(vec![
+            fixture_with_col1.col(0),
+            date_trunc_of(fixture_with_col1.col(1), "hour"),
+            fixture_with_col1.col(2),
+        ]);
+        assert_satisfaction(
+            "aligned hour split: Range(timestamp) subset-satisfies GROUP BY (key, date_trunc(hour, timestamp), col1)",
+            &aligned_with_col1,
+            &trunc_hour_superset,
+            &fixture_with_col1.eq_properties,
+            PartitioningSatisfaction::Subset,
+            PartitioningSatisfaction::NotSatisfied,
+        );
+
         let trunc_day = Distribution::KeyPartitioned(vec![
             fixture.col(0),
             date_trunc_of(fixture.col(1), "day"),

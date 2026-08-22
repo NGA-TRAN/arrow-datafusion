@@ -33,6 +33,11 @@
 # split is aligned to those bins, so (key, time_bin) is partition-disjoint.
 # Aggregation is one streaming SinglePartitioned step with no hash shuffle.
 #
+# Subset/superset satisfaction keeps that plan when GROUP BY adds extra
+# columns (for example col1): (key, time_bin, col1) is still partition-
+# disjoint, and a nested GROUP BY (col1, time_bin) reuses the projected
+# Range([time_bin]) without a hash shuffle.
+#
 # date_trunc('day') bins straddle the hour split, so that query still
 # hash-repartitions.
 
@@ -194,6 +199,80 @@ ORDER BY key, time_bin;
 ----
 k1 2024-01-01T00:00:00 33
 k2 2024-01-01T00:00:00 42
+
+##########
+# TEST 6: Inner aggregation with a GROUP BY superset of TEST 4.
+# Adding col1 does not change partition disjointness: Range([timestamp])
+# still subset-satisfies GROUP BY (key, date_trunc('hour', timestamp), col1)
+# because date_trunc('hour') is aligned to the hour split. The inner plan
+# stays one SinglePartitioned streaming step with no hash shuffle.
+# ordering_mode is PartiallySorted rather than Sorted because col1 is not
+# in the file sort order (key, timestamp).
+##########
+
+query TT
+EXPLAIN SELECT key, col1, date_trunc('hour', timestamp) AS time_bin, sum(value) as value
+FROM range_sorted_time_bin
+WHERE col4 = 'a'
+GROUP BY key, time_bin, col1;
+----
+physical_plan
+01)ProjectionExec: expr=[key@0 as key, col1@2 as col1, date_trunc(Utf8("hour"),range_sorted_time_bin.timestamp)@1 as time_bin, sum(range_sorted_time_bin.value)@3 as value]
+02)--AggregateExec: mode=SinglePartitioned, gby=[key@0 as key, date_trunc(hour, timestamp@2) as date_trunc(Utf8("hour"),range_sorted_time_bin.timestamp), col1@1 as col1], aggr=[sum(range_sorted_time_bin.value)], ordering_mode=PartiallySorted([0, 1])
+03)----FilterExec: col4@2 = a, projection=[key@0, col1@1, timestamp@3, value@4]
+04)------DataSourceExec: file_groups={2 groups: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch_range_partitioning/range_sorted_time_bin/part-0.parquet], [WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch_range_partitioning/range_sorted_time_bin/part-1.parquet]]}, projection=[key, col1, col4, timestamp, value], output_ordering=[key@0 ASC, timestamp@3 ASC], output_partitioning=Range([timestamp@3 ASC], [(1704070800000000000)], 2), file_type=parquet, predicate=col4@4 = a, pruning_predicate=col4_null_count@2 != row_count@3 AND col4_min@0 <= a AND a <= col4_max@1, required_guarantees=[col4 in (a)]
+
+query TTPI
+SELECT key, col1, date_trunc('hour', timestamp) AS time_bin, sum(value) as value
+FROM range_sorted_time_bin
+WHERE col4 = 'a'
+GROUP BY key, time_bin, col1
+ORDER BY key, time_bin, col1;
+----
+k1 x 2024-01-01T00:00:00 3
+k1 x 2024-01-01T01:00:00 30
+k2 x 2024-01-01T00:00:00 7
+k2 x 2024-01-01T01:00:00 35
+
+##########
+# TEST 7: Nested aggregation. The inner step is TEST 6 (GROUP BY key,
+# time_bin, col1). The outer step groups by (col1, time_bin). Range
+# partitioning projects through date_trunc('hour') onto time_bin, so the
+# outer grouping is also a superset of the range key and stays
+# SinglePartitioned with no hash shuffle.
+##########
+
+query TT
+EXPLAIN SELECT col1, sum(value)
+FROM (
+     SELECT key, col1, date_trunc('hour', timestamp) AS time_bin, sum(value) as value
+     FROM range_sorted_time_bin
+     WHERE col4 = 'a'
+     GROUP BY key, time_bin, col1
+) as inner
+GROUP BY col1, time_bin;
+----
+physical_plan
+01)ProjectionExec: expr=[col1@0 as col1, sum(inner.value)@2 as sum(inner.value)]
+02)--AggregateExec: mode=SinglePartitioned, gby=[col1@0 as col1, time_bin@1 as time_bin], aggr=[sum(inner.value)]
+03)----ProjectionExec: expr=[col1@2 as col1, date_trunc(Utf8("hour"),range_sorted_time_bin.timestamp)@1 as time_bin, sum(range_sorted_time_bin.value)@3 as value]
+04)------AggregateExec: mode=SinglePartitioned, gby=[key@0 as key, date_trunc(hour, timestamp@2) as date_trunc(Utf8("hour"),range_sorted_time_bin.timestamp), col1@1 as col1], aggr=[sum(range_sorted_time_bin.value)], ordering_mode=PartiallySorted([0, 1])
+05)--------FilterExec: col4@2 = a, projection=[key@0, col1@1, timestamp@3, value@4]
+06)----------DataSourceExec: file_groups={2 groups: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch_range_partitioning/range_sorted_time_bin/part-0.parquet], [WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch_range_partitioning/range_sorted_time_bin/part-1.parquet]]}, projection=[key, col1, col4, timestamp, value], output_ordering=[key@0 ASC, timestamp@3 ASC], output_partitioning=Range([timestamp@3 ASC], [(1704070800000000000)], 2), file_type=parquet, predicate=col4@4 = a, pruning_predicate=col4_null_count@2 != row_count@3 AND col4_min@0 <= a AND a <= col4_max@1, required_guarantees=[col4 in (a)]
+
+query TI
+SELECT col1, sum(value)
+FROM (
+     SELECT key, col1, date_trunc('hour', timestamp) AS time_bin, sum(value) as value
+     FROM range_sorted_time_bin
+     WHERE col4 = 'a'
+     GROUP BY key, time_bin, col1
+) as inner
+GROUP BY col1, time_bin
+ORDER BY col1, time_bin;
+----
+x 10
+x 65
 
 ##########
 # CLEANUP
