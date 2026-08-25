@@ -415,6 +415,149 @@ pub(super) fn register_range_sorted_time_bin_table(ctx: &SessionContext) {
     );
 }
 
+/// Row: (key, timestamp_ns, value)
+type TimeBinFactRow = (&'static str, i64, i64);
+
+/// Row: (key, col1, col2, timestamp_ns)
+type TimeBinDimRow = (&'static str, &'static str, &'static str, i64);
+
+/// Registers a small dim and large fact table for star-schema time-bin tests.
+///
+/// Both tables use the same hour range split as [`register_range_sorted_time_bin_table`]:
+/// - partition 0: `[2024-01-01 00:00, 01:00)`
+/// - partition 1: `[2024-01-01 01:00, 02:00)`
+///
+/// `range_sorted_time_bin_fact` is sorted on `(key, timestamp)`.
+/// `range_sorted_time_bin_dim` is a small per-(key, hour) dimension.
+pub(super) fn register_range_sorted_time_bin_star_tables(ctx: &SessionContext) {
+    let hour_split = time_bin_ts(60, 0);
+    let output_partitioning = Partitioning::Range(
+        RangePartitioning::try_new(
+            vec![col("timestamp").sort(true, true)],
+            vec![SplitPoint::new(vec![ScalarValue::TimestampNanosecond(
+                Some(hour_split),
+                None,
+            )])],
+        )
+        .expect("time-bin range partitioning should be valid"),
+    );
+
+    let fact_schema = Arc::new(Schema::new(vec![
+        Field::new("key", DataType::Utf8, false),
+        Field::new(
+            "timestamp",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            false,
+        ),
+        Field::new("value", DataType::Int64, false),
+    ]));
+    let fact_partitions: [Vec<TimeBinFactRow>; 2] = [
+        vec![
+            ("k1", time_bin_ts(0, 10), 1),
+            ("k1", time_bin_ts(0, 40), 2),
+            ("k1", time_bin_ts(1, 10), 99),
+            ("k2", time_bin_ts(30, 0), 3),
+            ("k2", time_bin_ts(30, 30), 4),
+        ],
+        vec![
+            ("k1", time_bin_ts(60, 10), 10),
+            ("k1", time_bin_ts(60, 40), 20),
+            ("k2", time_bin_ts(90, 0), 30),
+            ("k2", time_bin_ts(105, 0), 5),
+        ],
+    ];
+    let fact_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("test_files/scratch_range_partitioning/range_sorted_time_bin_fact");
+    let fact_batches = fact_partitions
+        .iter()
+        .map(|rows| time_bin_fact_batch(Arc::clone(&fact_schema), rows))
+        .collect();
+    register_parquet_listing_table(
+        ctx,
+        "range_sorted_time_bin_fact",
+        &fact_dir,
+        fact_schema,
+        fact_batches,
+        output_partitioning.clone(),
+        Some(vec![vec![
+            col("key").sort(true, true),
+            col("timestamp").sort(true, true),
+        ]]),
+    );
+
+    let dim_schema = Arc::new(Schema::new(vec![
+        Field::new("key", DataType::Utf8, false),
+        Field::new("col1", DataType::Utf8, false),
+        Field::new("col2", DataType::Utf8, false),
+        Field::new(
+            "timestamp",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            false,
+        ),
+    ]));
+    // One dim row per (key, hour). col1='b' on k2 in hour 1 is dropped by the
+    // test filter so that hour-1 k2 facts do not join.
+    let dim_partitions: [Vec<TimeBinDimRow>; 2] = [
+        vec![
+            ("k1", "x", "y", time_bin_ts(0, 0)),
+            ("k2", "x", "z", time_bin_ts(30, 0)),
+        ],
+        vec![
+            ("k1", "x", "y", time_bin_ts(60, 0)),
+            ("k2", "b", "w", time_bin_ts(90, 0)),
+        ],
+    ];
+    let dim_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("test_files/scratch_range_partitioning/range_sorted_time_bin_dim");
+    let dim_batches = dim_partitions
+        .iter()
+        .map(|rows| time_bin_dim_batch(Arc::clone(&dim_schema), rows))
+        .collect();
+    register_parquet_listing_table(
+        ctx,
+        "range_sorted_time_bin_dim",
+        &dim_dir,
+        dim_schema,
+        dim_batches,
+        output_partitioning,
+        None,
+    );
+}
+
+fn time_bin_fact_batch(schema: SchemaRef, rows: &[TimeBinFactRow]) -> RecordBatch {
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from_iter_values(rows.iter().map(|row| row.0)))
+                as ArrayRef,
+            Arc::new(TimestampNanosecondArray::from_iter_values(
+                rows.iter().map(|row| row.1),
+            )) as ArrayRef,
+            Arc::new(Int64Array::from_iter_values(rows.iter().map(|row| row.2)))
+                as ArrayRef,
+        ],
+    )
+    .expect("time-bin fact batch should be valid")
+}
+
+fn time_bin_dim_batch(schema: SchemaRef, rows: &[TimeBinDimRow]) -> RecordBatch {
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from_iter_values(rows.iter().map(|row| row.0)))
+                as ArrayRef,
+            Arc::new(StringArray::from_iter_values(rows.iter().map(|row| row.1)))
+                as ArrayRef,
+            Arc::new(StringArray::from_iter_values(rows.iter().map(|row| row.2)))
+                as ArrayRef,
+            Arc::new(TimestampNanosecondArray::from_iter_values(
+                rows.iter().map(|row| row.3),
+            )) as ArrayRef,
+        ],
+    )
+    .expect("time-bin dim batch should be valid")
+}
+
 fn time_bin_batch(schema: SchemaRef, rows: &[TimeBinRow]) -> RecordBatch {
     RecordBatch::try_new(
         schema,
