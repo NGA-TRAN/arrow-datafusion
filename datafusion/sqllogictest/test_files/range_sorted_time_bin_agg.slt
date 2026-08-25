@@ -40,10 +40,12 @@
 #       aggregation is one streaming SinglePartitioned step with no hash shuffle.
 #    ii. `date_bin(70 minutes)` or `date_trunc('day')` will need data in both streams and thus
 #       the query plan still needs a hash-repartition.
-#    iii. Adding extra GROUP BY columns (for example col1) keeps (key, time_bin, col1)
+#    iii. GROUP BY `date_bin(timestamp)` or `date_trunc('hour', timestamp)` alone is Exact
+#         when bins do not straddle the hour split, so those queries also skip the hash shuffle.
+#    iv. Adding extra GROUP BY columns (for example col1) keeps (key, time_bin, col1)
 #         partition-disjoint, and a nested GROUP BY (col1, time_bin) reuses the
 #         projected Range([time_bin]) without a hash shuffle.
-#    iv. Star-schema: fact is aggregated by (key, date_bin) then hash-joined to a
+#    v. Star-schema: fact is aggregated by (key, date_bin) then hash-joined to a
 #        small dim on (key, time_bin). Both tables share the same timestamp Range
 #        splits, so a partitioned HashJoin and the outer GROUP BY (col2, time_bin)
 #        stay correct without a RepartitionExec. Joining on key alone would not:
@@ -272,7 +274,64 @@ k2 2024-01-01T00:50:00 35
 
 
 ##########
-# TEST 7: Inner aggregation with a GROUP BY superset of TEST 4.
+# TEST 7: GROUP BY date_bin(timestamp) alone is Exact (Jay case 4).
+# The 60-second bins stay partition-disjoint, so aggregation is still one
+# streaming SinglePartitioned step with no hash shuffle.
+##########
+
+query TT
+EXPLAIN SELECT date_bin(INTERVAL '60 seconds', timestamp) AS time_bin, sum(value)
+FROM range_sorted_time_bin
+WHERE col4 = 'a'
+GROUP BY time_bin;
+----
+physical_plan
+01)ProjectionExec: expr=[date_bin(IntervalMonthDayNano("IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 60000000000 }"),range_sorted_time_bin.timestamp)@0 as time_bin, sum(range_sorted_time_bin.value)@1 as sum(range_sorted_time_bin.value)]
+02)--AggregateExec: mode=SinglePartitioned, gby=[date_bin(IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 60000000000 }, timestamp@0) as date_bin(IntervalMonthDayNano("IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 60000000000 }"),range_sorted_time_bin.timestamp)], aggr=[sum(range_sorted_time_bin.value)]
+03)----FilterExec: col4@0 = a, projection=[timestamp@1, value@2]
+04)------DataSourceExec: file_groups={2 groups: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch_range_partitioning/range_sorted_time_bin/part-0.parquet], [WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch_range_partitioning/range_sorted_time_bin/part-1.parquet]]}, projection=[col4, timestamp, value], output_partitioning=Range([timestamp@1 ASC], [(1704070800000000000)], 2), file_type=parquet, predicate=col4@4 = a, pruning_predicate=col4_null_count@2 != row_count@3 AND col4_min@0 <= a AND a <= col4_max@1, required_guarantees=[col4 in (a)]
+
+query PI
+SELECT date_bin(INTERVAL '60 seconds', timestamp) AS time_bin, sum(value)
+FROM range_sorted_time_bin
+WHERE col4 = 'a'
+GROUP BY time_bin
+ORDER BY time_bin;
+----
+2024-01-01T00:00:00 3
+2024-01-01T00:30:00 7
+2024-01-01T01:00:00 30
+2024-01-01T01:30:00 30
+2024-01-01T01:45:00 5
+
+##########
+# TEST 8: GROUP BY date_trunc('hour', timestamp) alone is also Exact.
+##########
+
+query TT
+EXPLAIN SELECT date_trunc('hour', timestamp) AS time_bin, sum(value)
+FROM range_sorted_time_bin
+WHERE col4 = 'a'
+GROUP BY time_bin;
+----
+physical_plan
+01)ProjectionExec: expr=[date_trunc(Utf8("hour"),range_sorted_time_bin.timestamp)@0 as time_bin, sum(range_sorted_time_bin.value)@1 as sum(range_sorted_time_bin.value)]
+02)--AggregateExec: mode=SinglePartitioned, gby=[date_trunc(hour, timestamp@0) as date_trunc(Utf8("hour"),range_sorted_time_bin.timestamp)], aggr=[sum(range_sorted_time_bin.value)]
+03)----FilterExec: col4@0 = a, projection=[timestamp@1, value@2]
+04)------DataSourceExec: file_groups={2 groups: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch_range_partitioning/range_sorted_time_bin/part-0.parquet], [WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch_range_partitioning/range_sorted_time_bin/part-1.parquet]]}, projection=[col4, timestamp, value], output_partitioning=Range([timestamp@1 ASC], [(1704070800000000000)], 2), file_type=parquet, predicate=col4@4 = a, pruning_predicate=col4_null_count@2 != row_count@3 AND col4_min@0 <= a AND a <= col4_max@1, required_guarantees=[col4 in (a)]
+
+query PI
+SELECT date_trunc('hour', timestamp) AS time_bin, sum(value)
+FROM range_sorted_time_bin
+WHERE col4 = 'a'
+GROUP BY time_bin
+ORDER BY time_bin;
+----
+2024-01-01T00:00:00 10
+2024-01-01T01:00:00 65
+
+##########
+# TEST 9: Inner aggregation with a GROUP BY superset of TEST 4.
 # Adding col1 does not change partition disjointness: Range([timestamp])
 # still subset-satisfies GROUP BY (key, date_trunc('hour', timestamp), col1)
 # because date_trunc('hour') is aligned to the hour split. The inner plan
@@ -306,7 +365,7 @@ k2 x 2024-01-01T00:00:00 7
 k2 x 2024-01-01T01:00:00 35
 
 ##########
-# TEST 8: Nested aggregation. The inner step is TEST 7 (GROUP BY key,
+# TEST 10: Nested aggregation. The inner step is TEST 9 (GROUP BY key,
 # time_bin, col1). The outer step groups by (col1, time_bin). Range
 # partitioning projects through date_trunc('hour') onto time_bin, so the
 # outer grouping is also a superset of the range key and stays
@@ -345,7 +404,7 @@ x 2024-01-01T00:00:00 10
 x 2024-01-01T01:00:00 65
 
 ##########
-# TEST 9: Star-schema join after fact time-bin aggregation.
+# TEST 11: Star-schema join after fact time-bin aggregation.
 #
 #   dim  (small): key, timestamp, col1, col2 — Range([timestamp]), same hour split
 #   fact (large): key FK, timestamp, value  — Range([timestamp]), sorted (key, timestamp)

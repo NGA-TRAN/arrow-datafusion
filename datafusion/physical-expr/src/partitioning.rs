@@ -400,29 +400,48 @@ fn evaluate_expr_on_key(
 
 /// `Range([x])` satisfies grouping by `(..., f(x), ...)` when `f` is monotonic in
 /// `x` and adjacent partitions do not share `f` values (bins do not straddle
-/// split points). That makes `(key, date_bin(timestamp))` and
-/// `(key, date_trunc(timestamp))` partition-disjoint when the table is
-/// range-partitioned on `timestamp` and the split is aligned to the bin.
-fn range_monotonic_fn_satisfies_keys(
+/// split points).
+///
+/// - [`PartitioningSatisfaction::Exact`] when every required key is such an
+///   `f(x)` (for example `GROUP BY date_bin(x)`).
+/// - [`PartitioningSatisfaction::Subset`] when at least one required key is
+///   such an `f(x)` and others are not (for example `GROUP BY date_bin(x), baz`),
+///   and `allow_subset` is true.
+///
+/// Multi-key Range + monotonic transforms (e.g. `Range([key, timestamp])`
+/// + `GROUP BY (key, date_bin(timestamp))`) is not handled here; see #24644.
+fn range_monotonic_fn_satisfaction(
     range: &RangePartitioning,
     required_exprs: &[Arc<dyn PhysicalExpr>],
     eq_properties: &EquivalenceProperties,
-) -> bool {
-    // Multi-key Range + monotonic transforms (e.g. Range([key, timestamp])
-    // + GROUP BY (key, date_bin(timestamp))) is not handled here; see #24644.
-    if range.ordering().len() != 1 {
-        return false;
+    allow_subset: bool,
+) -> PartitioningSatisfaction {
+    if range.ordering().len() != 1 || required_exprs.is_empty() {
+        return PartitioningSatisfaction::NotSatisfied;
     }
     let range_key = &range.ordering()[0].expr;
-    required_exprs.iter().any(|required| {
-        eq_properties.check_monotonic_transform(required, range_key)
-            && monotonic_fn_keeps_partitions_disjoint(
-                required,
-                range_key,
-                range.split_points(),
-                0,
-            )
-    })
+    let matching = required_exprs
+        .iter()
+        .filter(|required| {
+            eq_properties.check_monotonic_transform(required, range_key)
+                && monotonic_fn_keeps_partitions_disjoint(
+                    required,
+                    range_key,
+                    range.split_points(),
+                    0,
+                )
+        })
+        .count();
+
+    if matching == 0 {
+        PartitioningSatisfaction::NotSatisfied
+    } else if matching == required_exprs.len() {
+        PartitioningSatisfaction::Exact
+    } else if allow_subset {
+        PartitioningSatisfaction::Subset
+    } else {
+        PartitioningSatisfaction::NotSatisfied
+    }
 }
 
 impl Display for RangePartitioning {
@@ -581,19 +600,15 @@ impl Partitioning {
                         eq_properties,
                         allow_subset,
                     );
-                    if satisfaction == PartitioningSatisfaction::NotSatisfied
-                        && range_monotonic_fn_satisfies_keys(
+                    if satisfaction != PartitioningSatisfaction::NotSatisfied {
+                        satisfaction
+                    } else {
+                        range_monotonic_fn_satisfaction(
                             range,
                             required_exprs,
                             eq_properties,
+                            allow_subset,
                         )
-                    {
-                        // A monotonic transform of the range key (for example
-                        // `date_bin(timestamp)`) is not Hash-subset logic, so
-                        // this is independent of `allow_subset`.
-                        PartitioningSatisfaction::Subset
-                    } else {
-                        satisfaction
                     }
                 }
                 Partitioning::RoundRobinBatch(_)
@@ -1459,7 +1474,7 @@ mod tests {
             &required,
             &fixture.eq_properties,
             PartitioningSatisfaction::Subset,
-            PartitioningSatisfaction::Subset,
+            PartitioningSatisfaction::NotSatisfied,
         );
         assert_satisfaction(
             "unaligned split does not satisfy date_bin grouping",
@@ -1480,7 +1495,7 @@ mod tests {
             &trunc_hour,
             &fixture.eq_properties,
             PartitioningSatisfaction::Subset,
-            PartitioningSatisfaction::Subset,
+            PartitioningSatisfaction::NotSatisfied,
         );
 
         let fixture_with_col1 = PartitioningTestFixture::new(vec![
@@ -1548,12 +1563,12 @@ mod tests {
             60_000_000_000,
         )]);
         assert_satisfaction(
-            "aligned hour split: Range(timestamp) subset-satisfies GROUP BY date_bin(60s, timestamp)",
+            "aligned hour split: Range(timestamp) exactly satisfies GROUP BY date_bin(60s, timestamp)",
             &aligned,
             &bin_only,
             &fixture.eq_properties,
-            PartitioningSatisfaction::Subset,
-            PartitioningSatisfaction::Subset,
+            PartitioningSatisfaction::Exact,
+            PartitioningSatisfaction::Exact,
         );
 
         let null_split = fixture.range_partitioning(
@@ -1596,6 +1611,211 @@ mod tests {
             &fixture.eq_properties,
             PartitioningSatisfaction::NotSatisfied,
             PartitioningSatisfaction::NotSatisfied,
+        );
+
+        Ok(())
+    }
+
+    /// Range([a]) vs grouping keys, including monotonic `date_bin(a)`.
+    ///
+    /// 1. GROUP BY a, baz          → Subset
+    /// 2. GROUP BY a               → Exact
+    /// 3. GROUP BY date_bin(a), baz → Subset
+    /// 4. GROUP BY date_bin(a)      → Exact
+    #[test]
+    fn range_partitioning_monotonic_fn_exact_vs_subset() -> Result<()> {
+        let fixture = PartitioningTestFixture::new(vec![
+            ("a", DataType::Timestamp(TimeUnit::Nanosecond, None)),
+            ("baz", DataType::Utf8),
+        ])?;
+        // 2024-01-01T01:00:00, aligned to a 60-second date_bin.
+        let hour_ns = 1_704_070_800_000_000_000i64;
+        let range_a = fixture.range_partitioning([0], vec![ts_ns_split(hour_ns)]);
+        let date_bin = date_bin_of(fixture.col(0), 60_000_000_000);
+
+        let cases = [
+            (
+                "1. GROUP BY a, baz: Range([a]) is a subset of the grouping key",
+                Distribution::KeyPartitioned(vec![fixture.col(0), fixture.col(1)]),
+                PartitioningSatisfaction::Subset,
+                PartitioningSatisfaction::NotSatisfied,
+            ),
+            (
+                "2. GROUP BY a: Range([a]) exactly matches the grouping key",
+                Distribution::KeyPartitioned(vec![fixture.col(0)]),
+                PartitioningSatisfaction::Exact,
+                PartitioningSatisfaction::Exact,
+            ),
+            (
+                "3. GROUP BY date_bin(a), baz: transformed range key is a subset of the grouping key",
+                Distribution::KeyPartitioned(vec![Arc::clone(&date_bin), fixture.col(1)]),
+                PartitioningSatisfaction::Subset,
+                PartitioningSatisfaction::NotSatisfied,
+            ),
+            (
+                "4. GROUP BY date_bin(a): transformed range key exactly matches the grouping key",
+                Distribution::KeyPartitioned(vec![date_bin]),
+                PartitioningSatisfaction::Exact,
+                PartitioningSatisfaction::Exact,
+            ),
+        ];
+
+        let mut failures = Vec::new();
+        for (desc, required, expected_with_subset, expected_without_subset) in cases {
+            let with_subset =
+                range_a.satisfaction(&required, &fixture.eq_properties, true);
+            let without_subset =
+                range_a.satisfaction(&required, &fixture.eq_properties, false);
+            if with_subset != expected_with_subset {
+                failures.push(format!(
+                    "{desc} with subset enabled: got {with_subset:?}, expected {expected_with_subset:?}"
+                ));
+            }
+            if without_subset != expected_without_subset {
+                failures.push(format!(
+                    "{desc} with subset disabled: got {without_subset:?}, expected {expected_without_subset:?}"
+                ));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "Range([a]) Exact vs Subset cases failed:\n{}",
+            failures.join("\n")
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn range_monotonic_fn_satisfaction_covers_remaining_key_shapes() -> Result<()> {
+        let fixture = PartitioningTestFixture::new(vec![
+            ("a", DataType::Timestamp(TimeUnit::Nanosecond, None)),
+            ("baz", DataType::Utf8),
+        ])?;
+        let hour_ns = 1_704_070_800_000_000_000i64;
+        let range_a = fixture.range_partitioning([0], vec![ts_ns_split(hour_ns)]);
+        let date_bin = date_bin_of(fixture.col(0), 60_000_000_000);
+        let trunc_hour = date_trunc_of(fixture.col(0), "hour");
+        let trunc_day = date_trunc_of(fixture.col(0), "day");
+
+        assert_satisfaction(
+            "empty grouping keys are not satisfied by Range",
+            &range_a,
+            &Distribution::KeyPartitioned(vec![]),
+            &fixture.eq_properties,
+            PartitioningSatisfaction::NotSatisfied,
+            PartitioningSatisfaction::NotSatisfied,
+        );
+        assert_satisfaction(
+            "GROUP BY date_trunc(hour, a) is Exact when the hour split is aligned",
+            &range_a,
+            &Distribution::KeyPartitioned(vec![Arc::clone(&trunc_hour)]),
+            &fixture.eq_properties,
+            PartitioningSatisfaction::Exact,
+            PartitioningSatisfaction::Exact,
+        );
+        assert_satisfaction(
+            "GROUP BY date_bin(a), date_trunc(hour, a) is Exact when both transforms stay disjoint",
+            &range_a,
+            &Distribution::KeyPartitioned(vec![
+                Arc::clone(&date_bin),
+                Arc::clone(&trunc_hour),
+            ]),
+            &fixture.eq_properties,
+            PartitioningSatisfaction::Exact,
+            PartitioningSatisfaction::Exact,
+        );
+        assert_satisfaction(
+            "GROUP BY date_bin(a), date_trunc(day, a) is Subset: only date_bin stays disjoint",
+            &range_a,
+            &Distribution::KeyPartitioned(vec![Arc::clone(&date_bin), trunc_day]),
+            &fixture.eq_properties,
+            PartitioningSatisfaction::Subset,
+            PartitioningSatisfaction::NotSatisfied,
+        );
+
+        let two_aligned = fixture.range_partitioning(
+            [0],
+            vec![
+                ts_ns_split(hour_ns),
+                ts_ns_split(hour_ns + 3_600_000_000_000),
+            ],
+        );
+        assert_satisfaction(
+            "multiple aligned splits still exactly satisfy GROUP BY date_bin(a)",
+            &two_aligned,
+            &Distribution::KeyPartitioned(vec![Arc::clone(&date_bin)]),
+            &fixture.eq_properties,
+            PartitioningSatisfaction::Exact,
+            PartitioningSatisfaction::Exact,
+        );
+
+        let mixed_alignment = fixture.range_partitioning(
+            [0],
+            vec![ts_ns_split(hour_ns), ts_ns_split(hour_ns + 30_000_000_000)],
+        );
+        assert_satisfaction(
+            "a later unaligned split makes date_bin grouping not disjoint",
+            &mixed_alignment,
+            &Distribution::KeyPartitioned(vec![date_bin]),
+            &fixture.eq_properties,
+            PartitioningSatisfaction::NotSatisfied,
+            PartitioningSatisfaction::NotSatisfied,
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn evaluate_and_project_split_points_cover_error_paths() -> Result<()> {
+        let fixture = PartitioningTestFixture::new(vec![
+            ("a", DataType::Timestamp(TimeUnit::Nanosecond, None)),
+            ("baz", DataType::Utf8),
+        ])?;
+        let hour_ns = 1_704_070_800_000_000_000i64;
+        let date_bin = date_bin_of(fixture.col(0), 60_000_000_000);
+        let split = ts_ns_split(hour_ns);
+
+        assert!(
+            evaluate_expr_on_key(&date_bin, &fixture.col(1), &split.values()[0])
+                .is_none(),
+            "date_bin(a) does not contain baz, so substitution is a no-op"
+        );
+        assert!(
+            evaluate_expr_on_key(
+                &date_bin,
+                &fixture.col(0),
+                &ScalarValue::Utf8(Some("not-a-timestamp".into())),
+            )
+            .is_none(),
+            "date_bin cannot evaluate a Utf8 stand-in for the timestamp key"
+        );
+        assert!(
+            project_split_points_through_fn(&date_bin, &fixture.col(0), &[split], 1)
+                .is_none(),
+            "key_idx past the split-point width cannot be projected"
+        );
+        assert!(
+            !monotonic_fn_keeps_partitions_disjoint(
+                &date_bin,
+                &fixture.col(0),
+                &[SplitPoint::new(vec![])],
+                0,
+            ),
+            "a split point missing the range key is not disjoint"
+        );
+
+        let empty_splits = fixture.range_partitioning([0], vec![]);
+        let target: Arc<dyn PhysicalExpr> = Arc::new(Column::new("time_bin", 0));
+        let mapping = ProjectionMapping::from_iter([(
+            Arc::clone(&date_bin),
+            ProjectionTargets::from(vec![(Arc::clone(&target), 0)]),
+        )]);
+        let projected = empty_splits.project(&mapping, &fixture.eq_properties);
+        assert_eq!(
+            projected.to_string(),
+            "Range([time_bin@0 ASC], [], 1)",
+            "empty split points are vacuously disjoint, so Range projects through date_bin"
         );
 
         Ok(())
@@ -1706,6 +1926,12 @@ mod tests {
                 .eq_properties
                 .check_monotonic_transform(&date_trunc, &ts_fixture.col(0)),
             "date_trunc preserves ASC"
+        );
+        assert!(
+            !int_fixture
+                .eq_properties
+                .check_monotonic_transform(&int_fixture.col(0), &neg),
+            "a column is not a transform of -x"
         );
 
         Ok(())
