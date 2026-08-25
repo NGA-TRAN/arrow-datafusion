@@ -46,10 +46,8 @@
 #         partition-disjoint, and a nested GROUP BY (col1, time_bin) reuses the
 #         projected Range([time_bin]) without a hash shuffle.
 #    v. Star-schema: fact is aggregated by (key, date_bin) then hash-joined to a
-#        small dim on (key, time_bin). Both tables share the same timestamp Range
-#        splits, so a partitioned HashJoin and the outer GROUP BY (col2, time_bin)
-#        stay correct without a RepartitionExec. Joining on key alone would not:
-#        the same key lives in both hour files.
+#        small dim on key. Join-on-key is not satisfied by Range([timestamp]),
+#        so both sides are Hash([key]) shuffled and keys match across hours.
 
 statement ok
 set datafusion.explain.physical_plan_only = true;
@@ -409,78 +407,85 @@ x 2024-01-01T01:00:00 65
 #   dim  (small): key, timestamp, col1, col2 — Range([timestamp]), same hour split
 #   fact (large): key FK, timestamp, value  — Range([timestamp]), sorted (key, timestamp)
 #
-#   1. Filter dim on col1 = 'x'
+#   1. Filter dim on col1 = 'x' (no date_bin on dim)
 #   2. Aggregate fact: GROUP BY (key, date_bin(60 minutes)) → sum(value) AS value
-#   3. Partitioned HashJoin on (key, time_bin)
+#   3. Partitioned HashJoin on key only
 #   4. Aggregate join output: GROUP BY (col2, time_bin) → sum(value)
 #
-# Join on (key, time_bin), not key alone. Both tables are range-partitioned on
-# timestamp, so the same key can appear in both hour files. Including time_bin
-# keeps matching rows in the same partition: a Partitioned HashJoin with no
-# RepartitionExec is still correct, and the outer GROUP BY (col2, time_bin)
-# could stay SinglePartitioned on the projected Range([time_bin]).
+# Join-on-key is not satisfied by Range([timestamp]): the same key lives in
+# both hour partitions (dim has k1 in hour 0 and hour 1). A partition-wise
+# join would miss cross-hour key matches, so both sides are Hash([key])
+# shuffled. Unused dim.timestamp is projected away, so the dim scan is
+# UnknownPartitioning rather than Range.
 #
-# The optimizer does not yet take that path. It hash-repartitions both join
-# inputs on (key, time_bin) and the outer aggregate on (col2, time_bin).
+# After the key shuffle, each fact key matches every dim row with that key:
+#   y 00:00 = 102 * 2, y 01:00 = 30 * 2, z 00:00 = 7, z 01:00 = 35
+# (hour-1 dim k2 has col1='b' and is filtered out, but hour-0 dim k2
+# still matches hour-1 fact k2).
 #
-# A still-correct plan with no RepartitionExec would be:
-#   AggregateExec SinglePartitioned GROUP BY (col2, time_bin)
-#     HashJoinExec Partitioned on (key, time_bin)
-#       AggregateExec SinglePartitioned GROUP BY (key, date_bin)  -- fact, Sorted
-#         DataSourceExec fact Range([timestamp])
-#       FilterExec col1 = 'x'
-#         DataSourceExec dim Range([timestamp])
+# Hash-join thresholds of 0 keep the join Partitioned (not CollectLeft) even
+# though dim is small. Dim is listed first so it is the build side and fact
+# is the probe side.
 ##########
+
+statement ok
+set datafusion.optimizer.hash_join_single_partition_threshold = 0;
+
+statement ok
+set datafusion.optimizer.hash_join_single_partition_threshold_rows = 0;
+
+statement ok
+set datafusion.optimizer.subset_repartition_threshold = 0;
 
 query TT
 EXPLAIN SELECT d.col2, f.time_bin, sum(f.value) AS value
 FROM (
+    SELECT key, col2
+    FROM range_sorted_time_bin_dim
+    WHERE col1 = 'x'
+) AS d
+JOIN (
     SELECT key, date_bin(INTERVAL '60 minutes', timestamp) AS time_bin, sum(value) AS value
     FROM range_sorted_time_bin_fact
     GROUP BY key, time_bin
 ) AS f
-JOIN (
-    SELECT key, col2, date_bin(INTERVAL '60 minutes', timestamp) AS time_bin
-    FROM range_sorted_time_bin_dim
-    WHERE col1 = 'x'
-) AS d
-ON f.key = d.key AND f.time_bin = d.time_bin
+ON f.key = d.key
 GROUP BY d.col2, f.time_bin;
 ----
 physical_plan
 01)ProjectionExec: expr=[col2@0 as col2, time_bin@1 as time_bin, sum(f.value)@2 as value]
 02)--AggregateExec: mode=FinalPartitioned, gby=[col2@0 as col2, time_bin@1 as time_bin], aggr=[sum(f.value)]
 03)----RepartitionExec: partitioning=Hash([col2@0, time_bin@1], 2), input_partitions=2
-04)------AggregateExec: mode=Partial, gby=[col2@2 as col2, time_bin@0 as time_bin], aggr=[sum(f.value)]
-05)--------HashJoinExec: mode=Partitioned, join_type=Inner, on=[(key@0, key@0), (time_bin@1, time_bin@2)], projection=[time_bin@1, value@2, col2@4]
-06)----------RepartitionExec: partitioning=Hash([key@0, time_bin@1], 2), input_partitions=2
-07)------------ProjectionExec: expr=[key@0 as key, date_bin(IntervalMonthDayNano("IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 3600000000000 }"),range_sorted_time_bin_fact.timestamp)@1 as time_bin, sum(range_sorted_time_bin_fact.value)@2 as value]
-08)--------------AggregateExec: mode=SinglePartitioned, gby=[key@0 as key, date_bin(IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 3600000000000 }, timestamp@1) as date_bin(IntervalMonthDayNano("IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 3600000000000 }"),range_sorted_time_bin_fact.timestamp)], aggr=[sum(range_sorted_time_bin_fact.value)], ordering_mode=Sorted
-09)----------------DataSourceExec: file_groups={2 groups: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch_range_partitioning/range_sorted_time_bin_fact/part-0.parquet], [WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch_range_partitioning/range_sorted_time_bin_fact/part-1.parquet]]}, projection=[key, timestamp, value], output_ordering=[key@0 ASC, timestamp@1 ASC], output_partitioning=Range([timestamp@1 ASC], [(1704070800000000000)], 2), file_type=parquet
-10)----------RepartitionExec: partitioning=Hash([key@0, time_bin@2], 2), input_partitions=2
-11)------------ProjectionExec: expr=[key@0 as key, col2@1 as col2, date_bin(IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 3600000000000 }, timestamp@2) as time_bin]
-12)--------------FilterExec: col1@1 = x, projection=[key@0, col2@2, timestamp@3]
-13)----------------DataSourceExec: file_groups={2 groups: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch_range_partitioning/range_sorted_time_bin_dim/part-0.parquet], [WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch_range_partitioning/range_sorted_time_bin_dim/part-1.parquet]]}, projection=[key, col1, col2, timestamp], output_partitioning=Range([timestamp@3 ASC], [(1704070800000000000)], 2), file_type=parquet, predicate=col1@1 = x, pruning_predicate=col1_null_count@2 != row_count@3 AND col1_min@0 <= x AND x <= col1_max@1, required_guarantees=[col1 in (x)]
+04)------AggregateExec: mode=Partial, gby=[col2@0 as col2, time_bin@1 as time_bin], aggr=[sum(f.value)]
+05)--------HashJoinExec: mode=Partitioned, join_type=Inner, on=[(key@0, key@0)], projection=[col2@1, time_bin@3, value@4]
+06)----------RepartitionExec: partitioning=Hash([key@0], 2), input_partitions=2
+07)------------FilterExec: col1@1 = x, projection=[key@0, col2@2]
+08)--------------DataSourceExec: file_groups={2 groups: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch_range_partitioning/range_sorted_time_bin_dim/part-0.parquet], [WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch_range_partitioning/range_sorted_time_bin_dim/part-1.parquet]]}, projection=[key, col1, col2], output_partitioning=UnknownPartitioning(2), file_type=parquet, predicate=col1@1 = x, pruning_predicate=col1_null_count@2 != row_count@3 AND col1_min@0 <= x AND x <= col1_max@1, required_guarantees=[col1 in (x)]
+09)----------RepartitionExec: partitioning=Hash([key@0], 2), input_partitions=2
+10)------------ProjectionExec: expr=[key@0 as key, date_bin(IntervalMonthDayNano("IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 3600000000000 }"),range_sorted_time_bin_fact.timestamp)@1 as time_bin, sum(range_sorted_time_bin_fact.value)@2 as value]
+11)--------------AggregateExec: mode=SinglePartitioned, gby=[key@0 as key, date_bin(IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 3600000000000 }, timestamp@1) as date_bin(IntervalMonthDayNano("IntervalMonthDayNano { months: 0, days: 0, nanoseconds: 3600000000000 }"),range_sorted_time_bin_fact.timestamp)], aggr=[sum(range_sorted_time_bin_fact.value)], ordering_mode=Sorted
+12)----------------DataSourceExec: file_groups={2 groups: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch_range_partitioning/range_sorted_time_bin_fact/part-0.parquet], [WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch_range_partitioning/range_sorted_time_bin_fact/part-1.parquet]]}, projection=[key, timestamp, value], output_ordering=[key@0 ASC, timestamp@1 ASC], output_partitioning=Range([timestamp@1 ASC], [(1704070800000000000)], 2), file_type=parquet
 
 query TPI
 SELECT d.col2, f.time_bin, sum(f.value) AS value
 FROM (
+    SELECT key, col2
+    FROM range_sorted_time_bin_dim
+    WHERE col1 = 'x'
+) AS d
+JOIN (
     SELECT key, date_bin(INTERVAL '60 minutes', timestamp) AS time_bin, sum(value) AS value
     FROM range_sorted_time_bin_fact
     GROUP BY key, time_bin
 ) AS f
-JOIN (
-    SELECT key, col2, date_bin(INTERVAL '60 minutes', timestamp) AS time_bin
-    FROM range_sorted_time_bin_dim
-    WHERE col1 = 'x'
-) AS d
-ON f.key = d.key AND f.time_bin = d.time_bin
+ON f.key = d.key
 GROUP BY d.col2, f.time_bin
 ORDER BY d.col2, f.time_bin;
 ----
-y 2024-01-01T00:00:00 102
-y 2024-01-01T01:00:00 30
+y 2024-01-01T00:00:00 204
+y 2024-01-01T01:00:00 60
 z 2024-01-01T00:00:00 7
+z 2024-01-01T01:00:00 35
 
 ##########
 # CLEANUP
@@ -496,6 +501,12 @@ reset datafusion.explain.physical_plan_only;
 
 statement ok
 reset datafusion.execution.collect_statistics;
+
+statement ok
+reset datafusion.optimizer.hash_join_single_partition_threshold;
+
+statement ok
+reset datafusion.optimizer.hash_join_single_partition_threshold_rows;
 
 statement ok
 reset datafusion.optimizer.subset_repartition_threshold;
